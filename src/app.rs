@@ -1,5 +1,6 @@
 use crate::analyzer::{AnalysisConfig, NoiseAnalyzer};
 use crate::audio::{AudioInput, AudioService, Result};
+use crate::radio::ic7300::Ic7300;
 use std::io::{self, Write};
 use std::sync::mpsc;
 use std::thread;
@@ -8,32 +9,39 @@ use std::time::{Duration, Instant};
 pub struct Application {
     input: Option<AudioInput>,
     analyzer: NoiseAnalyzer,
+    radio: Option<Ic7300>,
 }
 
 impl Application {
-    pub fn new() -> Self {
+    pub fn new(config: AnalysisConfig) -> Self {
         Self {
             input: None,
-            analyzer: NoiseAnalyzer::new(AnalysisConfig::default()),
+            analyzer: NoiseAnalyzer::new(config),
+            radio: None,
         }
     }
 
-    #[allow(clippy::println_empty_string)]
     pub fn run(&mut self) -> Result<()> {
         loop {
-            println!("\n=== IC-7300 Audio / Noise Monitor ===\n");
+            println!("\n=== IC-7300 Audio / Noise Monitor ===");
             match &self.input {
                 Some(input) => println!("Connected: {} ({} Hz)", input.name, input.sample_rate),
                 None => println!("Connected: none"),
             }
-            println!("");
             println!("1. List USB/audio input devices");
             println!("2. Connect to input device");
             println!("3. Live noise-floor monitor");
             println!("4. Disconnect audio device");
             println!("5. Measurement settings");
-            println!("x. Exit");
-            match prompt("\nSelect: ")?.as_str() {
+            println!("6. List serial/CAT ports");
+            println!("7. Connect to IC-7300 CAT");
+            println!("8. Test CAT (read frequency)");
+            println!("9. Disconnect CAT");
+            if let Some(r) = &self.radio {
+                println!("CAT: {} @ {} baud", r.port_name, r.baud_rate);
+            }
+            println!("0. Exit");
+            match prompt("Select: ")?.as_str() {
                 "1" => self.list_devices(),
                 "2" => self.connect(),
                 "3" => self.live(),
@@ -42,11 +50,76 @@ impl Application {
                     println!("Disconnected.");
                 }
                 "5" => self.settings(),
-                "x" => break,
+                "6" => self.list_serial_ports(),
+                "7" => self.connect_cat_interactive(),
+                "8" => self.test_cat(),
+                "9" => {
+                    self.radio = None;
+                    println!("CAT disconnected.");
+                }
+                "0" => break,
                 _ => println!("Invalid selection."),
             }
         }
         Ok(())
+    }
+
+    fn list_serial_ports(&self) {
+        match Ic7300::list_ports() {
+            Ok(ports) if ports.is_empty() => println!("No serial ports found."),
+            Ok(ports) => {
+                for port in ports {
+                    println!("{port}");
+                }
+            }
+            Err(e) => eprintln!("Serial enumeration failed: {e}"),
+        }
+    }
+
+    fn connect_cat_interactive(&mut self) {
+        self.list_serial_ports();
+        let Ok(port_name) = prompt("Port name (e.g. COM3 or /dev/ttyUSB0): ") else {
+            return;
+        };
+        if port_name.is_empty() {
+            println!("Port required.");
+            return;
+        }
+        let Ok(baud_text) = prompt("Baud rate [115200]: ") else {
+            return;
+        };
+        let baud_rate = if baud_text.is_empty() {
+            115200
+        } else {
+            match baud_text.parse::<u32>() {
+                Ok(rate) if rate > 0 => rate,
+                _ => {
+                    println!("Invalid baud rate.");
+                    return;
+                }
+            }
+        };
+        match self.connect_cat_port(&port_name, baud_rate) {
+            Ok(()) => println!("CAT serial port opened."),
+            Err(e) => eprintln!("CAT connection failed: {e}"),
+        }
+    }
+
+    pub fn connect_cat_port(&mut self, port_name: &str, baud_rate: u32) -> Result<()> {
+        let radio = Ic7300::connect(port_name, baud_rate)?;
+        self.radio = Some(radio);
+        Ok(())
+    }
+
+    fn test_cat(&mut self) {
+        let Some(radio) = self.radio.as_mut() else {
+            println!("Connect to the radio CAT port first.");
+            return;
+        };
+        match radio.read_frequency() {
+            Ok(hz) => println!("CAT OK: {:.6} MHz ({hz} Hz)", hz as f64 / 1_000_000.0),
+            Err(e) => eprintln!("CAT test failed: {e}"),
+        }
     }
 
     fn list_devices(&self) {
@@ -72,13 +145,20 @@ impl Application {
         };
         // Release old stream before opening the replacement.
         self.input = None;
-        match AudioService::connect(index) {
-            Ok(input) => {
-                println!("Connected to {} at {} Hz", input.name, input.sample_rate);
-                self.input = Some(input);
+        match self.connect_device(index) {
+            Ok(()) => {
+                if let Some(input) = &self.input {
+                    println!("Connected to {} at {} Hz", input.name, input.sample_rate);
+                }
             }
             Err(e) => eprintln!("Connection failed: {e}"),
         }
+    }
+
+    pub fn connect_device(&mut self, index: usize) -> Result<()> {
+        let input = AudioService::connect(index)?;
+        self.input = Some(input);
+        Ok(())
     }
 
     fn settings(&mut self) {
@@ -116,7 +196,7 @@ impl Application {
         }
     }
 
-    fn live(&self) {
+    pub fn live(&self) {
         let Some(input) = &self.input else {
             println!("Connect to an input device first.");
             return;
