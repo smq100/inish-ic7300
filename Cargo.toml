@@ -1,0 +1,8 @@
+[package]
+name = "ic7300-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.15"
+rustfft = "6.2"
